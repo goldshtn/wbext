@@ -1,8 +1,10 @@
-﻿using Microsoft.Diagnostics.Runtime.InteropLocal;
+﻿using HtmlAgilityPack;
+using Microsoft.Diagnostics.Runtime.InteropLocal;
 using RGiesecke.DllExport;
 using System;
 using System.IO;
 using System.Net;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Security.Policy;
 
@@ -100,6 +102,14 @@ namespace wbext
             Version = (Major << 16) + Minor;
             Flags = 0;
 
+            ResolveEventHandler resolver = (o, e) =>
+            {
+                string directory = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location);
+                var name = new AssemblyName(e.Name);
+                return Assembly.LoadFrom(Path.ChangeExtension(
+                    Path.Combine(directory, name.Name), ".dll"));
+            };
+
             // Everything below is to enable the extension to be loaded from another
             //  folder that is not the same of the Debugger
 
@@ -116,6 +126,9 @@ namespace wbext
 
             currDomain = AppDomain.CreateDomain("wbext", AppDomain.CurrentDomain.Evidence, setup);
             currDomain.UnhandledException += CurrDomain_UnhandledException;
+
+            AppDomain.CurrentDomain.AssemblyResolve += resolver;
+            currDomain.AssemblyResolve += resolver;
             
             return HRESULT.S_OK;
         }
@@ -195,19 +208,93 @@ namespace wbext
         }
 
         [DllExport]
-        public static HRESULT wb(IntPtr client, [MarshalAs(UnmanagedType.LPStr)] string Args)
+        public static HRESULT wb(IntPtr client, [MarshalAs(UnmanagedType.LPStr)] string args)
         {
             INIT_API();
             if (LastHR != HRESULT.S_OK)
                 return LastHR;
 
-            // TODO Replace links with DML that executes !wb with the link target
             var webClient = new WebClient();
-            var result = webClient.DownloadString(Args);
-            result = result.Replace('<', ' ').Replace('>', ' ').Replace('{', ' ').Replace('}', ' ');
-            WriteLine(result);
+            var result = webClient.DownloadString(args);
+            var document = new HtmlDocument();
+            document.LoadHtml(result);
+            var writer = new StringWriter();
+            ConvertTo(args, document.DocumentNode, writer);
+            WriteDmlLine(writer.ToString());
 
             return HRESULT.S_OK;
+        }
+
+        private static void ConvertTo(string startUrl, HtmlNode node, TextWriter outText)
+        {
+            string html;
+            switch (node.NodeType)
+            {
+                case HtmlNodeType.Comment:
+                    // don't output comments
+                    break;
+
+                case HtmlNodeType.Document:
+                    ConvertContentTo(startUrl, node, outText);
+                    break;
+
+                case HtmlNodeType.Text:
+                    // script and style must not be output
+                    string parentName = node.ParentNode.Name;
+                    if ((parentName == "script") || (parentName == "style"))
+                        break;
+
+                    // get text
+                    html = ((HtmlTextNode) node).Text;
+
+                    // is it in fact a special closing node output as text?
+                    if (HtmlNode.IsOverlappedClosingElement(html))
+                        break;
+
+                    // check the text is meaningful and not a bunch of whitespaces
+                    if (html.Trim().Length > 0)
+                    {
+                        outText.WriteLine(HtmlEntity.DeEntitize(html));
+                    }
+                    break;
+
+                case HtmlNodeType.Element:
+                    switch (node.Name)
+                    {
+                        case "title":
+                            outText.WriteLine($"<u>{node.InnerText}</u>");
+                            break;
+                        case "p":
+                            // treat paragraphs as crlf
+                            outText.Write("\r\n");
+                            break;
+                        case "a":
+                            string linkTarget = node.GetAttributeValue("href", "");
+                            if (!linkTarget.StartsWith("http"))
+                            {
+                                linkTarget = startUrl + linkTarget;
+                            }
+                            if (linkTarget != "")
+                            {
+                                outText.Write($"<exec cmd=\"!wb {linkTarget}\">{node.InnerText}</exec>");
+                            }
+                            break;
+                    }
+
+                    if (node.HasChildNodes)
+                    {
+                        ConvertContentTo(startUrl, node, outText);
+                    }
+                    break;
+            }
+        }
+
+        private static void ConvertContentTo(string startUrl, HtmlNode node, TextWriter outText)
+        {
+            foreach (HtmlNode subnode in node.ChildNodes)
+            {
+                ConvertTo(startUrl, subnode, outText);
+            }
         }
 
         private static string pFormat = String.Format(":x{0}", Marshal.SizeOf(IntPtr.Zero) * 2);
